@@ -886,6 +886,7 @@ async def _validate_fire_session_inputs(
                 workspace=task.workspace,
                 agent=agent,
                 agent_cache=deps.agent_cache,
+                permission_store=deps.permission_store,
                 host_store=deps.host_store,
                 host_registry=deps.host_registry,
             )
