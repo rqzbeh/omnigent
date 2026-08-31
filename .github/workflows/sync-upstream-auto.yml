@@ -1,0 +1,120 @@
+name: Auto Sync Upstream and Apply Patches
+
+on:
+  schedule:
+    # Run daily at 04:00 UTC
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: 'Target upstream tag to rebase patches onto (leave empty for latest release tag)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  packages: write
+  pull_requests: write
+  issues: write
+
+concurrency:
+  group: sync-upstream-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-and-patch:
+    name: Sync Upstream & Re-apply Patches
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git Author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch Upstream Tags
+        run: |
+          git remote add upstream https://github.com/omnigent-ai/omnigent.git || true
+          git fetch upstream --tags
+
+      - name: Determine Target Release Tag
+        id: target
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.target_tag }}" ]; then
+            TAG="${{ github.event.inputs.target_tag }}"
+          else
+            # Find latest official release tag (ignoring dev/rc unless explicitly targeted)
+            TAG=$(git tag -l "v*" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Selected target upstream tag: ${TAG}"
+
+      - name: Check if Already On Target Tag
+        id: check_current
+        run: |
+          set -euo pipefail
+          TARGET_TAG="${{ steps.target.outputs.tag }}"
+          # Check if the target tag commit is already an ancestor of main
+          TARGET_COMMIT=$(git rev-parse "${TARGET_TAG}")
+          if git merge-base --is-ancestor "${TARGET_COMMIT}" HEAD; then
+            echo "already_synced=true" >> "$GITHUB_OUTPUT"
+            echo "main is already up to date with ${TARGET_TAG}"
+          else
+            echo "already_synced=false" >> "$GITHUB_OUTPUT"
+            echo "New upstream release detected: ${TARGET_TAG}"
+          fi
+
+      - name: Attempt Automatic Patch Rebase
+        if: steps.check_current.outputs.already_synced == 'false'
+        id: rebase
+        run: |
+          set -euo pipefail
+          TARGET_TAG="${{ steps.target.outputs.tag }}"
+          NEW_BRANCH="sync-${TARGET_TAG}"
+
+          git checkout -B "${NEW_BRANCH}" "${TARGET_TAG}"
+
+          # Ensure patches directory exists in workspace
+          git checkout main -- patches/ .github/workflows/
+
+          echo "Applying admin host sharing patches..."
+          if git apply patches/0001-*.patch patches/0002-*.patch; then
+            git add .
+            git commit -m "feat(hosts): admin role gets access to all shared hosts (rebased on ${TARGET_TAG})"
+            git push origin "${NEW_BRANCH}" --force
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "Conflict occurred while applying patches onto ${TARGET_TAG}"
+          fi
+
+      - name: Open Pull Request on Success
+        if: steps.check_current.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET_TAG="${{ steps.target.outputs.tag }}"
+          NEW_BRANCH="sync-${TARGET_TAG}"
+          gh pr create \
+            --base main \
+            --head "${NEW_BRANCH}" \
+            --title "Automated Sync: Rebase Admin Host Sharing patches onto ${TARGET_TAG}" \
+            --body "Automated sync detected a new upstream release \`${TARGET_TAG}\`. The custom admin host sharing patches applied cleanly with 0 conflicts and the branch \`${NEW_BRANCH}\` has been pushed." || true
+
+      - name: Open Issue on Conflict
+        if: steps.check_current.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET_TAG="${{ steps.target.outputs.tag }}"
+          gh issue create \
+            --title "⚠️ Upstream Sync Conflict with ${TARGET_TAG}" \
+            --body "Automated sync attempted to rebase custom admin host sharing patches onto \`${TARGET_TAG}\`, but encountered merge/patch conflicts. Manual resolution is required."

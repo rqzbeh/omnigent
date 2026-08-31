@@ -3,6 +3,7 @@ name: Build and Publish Custom Omnigent (Admin Shared Hosts)
 on:
   push:
     branches:
+      - 'main'
       - 'v0.11.0-admin-shared-hosts'
       - 'v0.11.0-admin-hosts'
     tags:

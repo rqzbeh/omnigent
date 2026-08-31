@@ -1,0 +1,474 @@
+From 71033d1d43d986e5a9ce262a8d31cc86f778ec4c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Rouzbeh=E2=80=A0?= <rqzbeh@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 00:32:06 +0000
+Subject: [PATCH 1/2] feat(hosts): admin role gets access to all shared hosts
+
+Admins now see and control every host; non-admins keep owner-only access.
+
+- HostStore.list_all_hosts(): cross-user admin listing
+- resolve_host_owner(): is_admin flag waives ownership (runner launch + session-create workspace probe)
+- hosts.py routes: admin bypass on list + all single-host operations
+- workspace probe threads permission_store through helpers/scheduled paths
+- tests: admin bypass, non-admin still 403, list_all_hosts
+- designs/admin-host-access.md: future per-user grant + admin UI plan
+---
+ designs/admin-host-access.md                  | 66 ++++++++++++++++
+ omnigent/server/routes/_host_launch.py        |  8 +-
+ .../routes/_session_create_validation.py      |  7 ++
+ omnigent/server/routes/_sessions/helpers.py   |  1 +
+ omnigent/server/routes/hosts.py               | 41 +++++++---
+ omnigent/server/routes/scheduled_tasks.py     |  1 +
+ omnigent/server/scheduled/fire.py             |  1 +
+ omnigent/stores/host_store.py                 | 17 ++++
+ tests/server/routes/test_host_launch.py       | 77 +++++++++++++++++++
+ tests/stores/test_host_store.py               | 26 +++++++
+ 10 files changed, 235 insertions(+), 10 deletions(-)
+ create mode 100644 designs/admin-host-access.md
+
+diff --git a/designs/admin-host-access.md b/designs/admin-host-access.md
+new file mode 100644
+index 000000000..3d666946b
+--- /dev/null
++++ b/designs/admin-host-access.md
+@@ -0,0 +1,66 @@
++# Admin Shared-Host Access & Per-User Host Access Management
++
++## Current behavior (this change)
++
++Hosts are owned by the user who registered them (`hosts.user_id`). Every
++host-facing route checked `host.user_id == current_user_id` before acting.
++
++This change makes the **admin role** able to see and control **every** host,
++matching a shared-host deployment model:
++
++- `GET /v1/hosts` — admins list all hosts (via `HostStore.list_all_hosts`);
++  non-admins list only their own.
++- All single-host routes (`get`, `model-options`, `runners`, `filesystem`,
++  `directories`, `harness install/credential`, `detected`, `worktrees`) — admins
++  bypass the ownership check.
++- `resolve_host_owner` (used by runner launch and the session-create workspace
++  probe) accepts an `is_admin` flag and waives ownership for admins.
++
++Non-admin behavior is unchanged: a non-admin only sees and controls hosts they
++own, and still gets 403/404 on anyone else's.
++
++### Where the admin flag lives
++
++`PermissionStore.is_admin(user_id)` (the existing admin flag on the account).
++When auth is disabled (`permission_store is None`) the admin path is inert and
++behavior is unchanged.
++
++## Future plan: per-user host access management
++
++The admin role is a coarse binary grant. A future refinement is **explicit,
++per-user host access**: an admin UI where an administrator grants or revokes a
++specific user's access to a specific host.
++
++### Design
++
++Reuse the existing permission machinery that already supports resource grants
++(`permission_store.grant` / `resolve_access`), generalising hosts as a
++grantable resource:
++
++1. **Schema**: a `host_grants` table — `(host_id, user_id, level)`.
++
++2. **Access resolution**: replace the simple `owner or admin` check with
++   `owner or admin or resolved_access(host)`:
++   - owner → level `OWNER`
++   - admin → full access (implicit)
++   - explicit grant row → the stored level
++   - otherwise → none
++
++3. **Admin API** (admin-only):
++   - `GET /v1/admin/hosts/{host_id}/grants` — list who can use the host.
++   - `PUT /v1/admin/hosts/{host_id}/grants/{user_id}` — set a level.
++   - `DELETE /v1/admin/hosts/{host_id}/grants/{user_id}` — revoke.
++   All gated behind `PermissionStore.is_admin`.
++
++4. **Admin UI**: a page under the admin section listing every host and every
++   user, with per-user access rows that can be added/removed. This is the
++   "another place where you can add or remove access to hosts for each user"
++   the product owner asked for.
++
++5. **Tests**: admin CRUD on grants; non-admin cannot grant; access resolution
++   combines owner + admin + grant.
++
++Because `resolve_host_owner` is the single chokepoint for host access, the
++grant-aware check plugs into exactly one place — the access predicate already
++introduced here (`is_admin`) simply becomes `admin or granted` without touching
++route handlers.
+\ No newline at end of file
+diff --git a/omnigent/server/routes/_host_launch.py b/omnigent/server/routes/_host_launch.py
+index ed5768363..e827b6049 100644
+--- a/omnigent/server/routes/_host_launch.py
++++ b/omnigent/server/routes/_host_launch.py
+@@ -52,6 +52,7 @@ def resolve_host_owner(
+     user_id: str | None,
+     host_id: str,
+     host_store: HostStore,
++    is_admin: bool = False,
+ ) -> Host:
+     """
+     Authorize that the caller owns a known host.
+@@ -75,7 +76,7 @@ def resolve_host_owner(
+     host = host_store.get_host(host_id)
+     if host is None:
+         raise HTTPException(status_code=404, detail="host not found")
+-    if user_id is not None and host.user_id != user_id:
++    if user_id is not None and not is_admin and host.user_id != user_id:
+         raise HTTPException(status_code=403, detail="not your host")
+     return host
+ 
+@@ -125,6 +126,11 @@ def resolve_host_launch(
+         user_id=user_id,
+         host_id=host_id,
+         host_store=host_store,
++        is_admin=(
++            permission_store is not None
++            and user_id is not None
++            and permission_store.is_admin(user_id)
++        ),
+     )
+ 
+     conn = host_registry.get(host_id)
+diff --git a/omnigent/server/routes/_session_create_validation.py b/omnigent/server/routes/_session_create_validation.py
+index 1b7ba9019..95a501a82 100644
+--- a/omnigent/server/routes/_session_create_validation.py
++++ b/omnigent/server/routes/_session_create_validation.py
+@@ -195,6 +195,7 @@ async def validate_existing_host_workspace(
+     workspace: str | None,
+     agent: Any,
+     agent_cache: AgentCache | None,
++    permission_store: Any | None = None,
+     host_store: Any | None,
+     host_registry: Any | None,
+ ) -> str:
+@@ -239,11 +240,17 @@ async def validate_existing_host_workspace(
+     # name for error messages.
+     host_name: str | None = None
+     if host_store is not None:
++        is_admin = (
++            permission_store is not None
++            and user_id is not None
++            and await asyncio.to_thread(permission_store.is_admin, user_id)
++        )
+         host = await asyncio.to_thread(
+             resolve_host_owner,
+             user_id=user_id,
+             host_id=host_id,
+             host_store=host_store,
++            is_admin=is_admin,
+         )
+         host_name = host.name
+         # Wrong-replica classification, same as the /v1/hosts/* endpoints and
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index 804b42105..aa6d6d1fe 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -4658,6 +4658,7 @@ async def _validate_session_workspace(
+         workspace=workspace,
+         agent=agent,
+         agent_cache=agent_cache,
++        permission_store=getattr(request.app.state, "permission_store", None),
+         host_store=getattr(request.app.state, "host_store", None),
+         host_registry=getattr(request.app.state, "host_registry", None),
+     )
+diff --git a/omnigent/server/routes/hosts.py b/omnigent/server/routes/hosts.py
+index ac4e21fd1..1a9cf0ad4 100644
+--- a/omnigent/server/routes/hosts.py
++++ b/omnigent/server/routes/hosts.py
+@@ -577,6 +577,17 @@ def create_hosts_router(
+     flags = feature_flags or resolve_feature_flags()
+     router = APIRouter()
+ 
++    async def _is_admin(user_id: str | None) -> bool:
++        """True when the caller holds the admin role.
++
++        Admin users may use every host (ownership is bypassed), matching
++        the shared-host model where admin roles control all hosts. Returns
++        False when auth is disabled or the user lacks the admin flag.
++        """
++        if user_id is None or permission_store is None:
++            return False
++        return await asyncio.to_thread(permission_store.is_admin, user_id)
++
+     @router.get("/hosts")
+     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
+         """List all hosts owned by the authenticated user.
+@@ -594,7 +605,11 @@ def create_hosts_router(
+         # only when auth is disabled entirely — there the single-user
+         # server's hosts are owned by the reserved "local" user.
+         user_id = require_user(request, auth_provider)
+-        if user_id is None:
++        if await _is_admin(user_id):
++            # Admin role: shared-host model — admin users see and can
++            # control every host, not just their own.
++            hosts = await asyncio.to_thread(host_store.list_all_hosts)
++        elif user_id is None:
+             hosts = await asyncio.to_thread(host_store.list_hosts, "local")
+         else:
+             hosts = await asyncio.to_thread(host_store.list_hosts, user_id)
+@@ -655,7 +670,8 @@ def create_hosts_router(
+         host = await asyncio.to_thread(host_store.get_host, host_id)
+         if host is None:
+             raise HTTPException(status_code=404, detail="host not found")
+-        if user_id is not None and host.user_id != user_id:
++        is_admin = await _is_admin(user_id)
++        if user_id is not None and host.user_id != user_id and not is_admin:
+             raise HTTPException(status_code=403, detail="not your host")
+ 
+         # Status comes from the DB so the answer is consistent across
+@@ -692,7 +708,8 @@ def create_hosts_router(
+         host = await asyncio.to_thread(host_store.get_host, host_id)
+         if host is None:
+             raise HTTPException(status_code=404, detail="host not found")
+-        if user_id is not None and host.user_id != user_id:
++        is_admin = await _is_admin(user_id)
++        if user_id is not None and host.user_id != user_id and not is_admin:
+             raise HTTPException(status_code=403, detail="not your host")
+         conn = host_registry.get(host.host_id)
+         if conn is None:
+@@ -1125,7 +1142,8 @@ def create_hosts_router(
+         host = await asyncio.to_thread(host_store.get_host, host_id)
+         if host is None:
+             raise HTTPException(status_code=404, detail="host not found")
+-        if user_id is not None and host.user_id != user_id:
++        is_admin = await _is_admin(user_id)
++        if user_id is not None and host.user_id != user_id and not is_admin:
+             raise HTTPException(status_code=403, detail="not your host")
+ 
+         if "\x00" in path:
+@@ -1206,7 +1224,8 @@ def create_hosts_router(
+         host = await asyncio.to_thread(host_store.get_host, host_id)
+         if host is None:
+             raise HTTPException(status_code=404, detail="host not found")
+-        if user_id is not None and host.user_id != user_id:
++        is_admin = await _is_admin(user_id)
++        if user_id is not None and host.user_id != user_id and not is_admin:
+             raise HTTPException(status_code=403, detail="not your host")
+ 
+         path = body.path
+@@ -1310,7 +1329,8 @@ def create_hosts_router(
+         host = await asyncio.to_thread(host_store.get_host, host_id)
+         if host is None:
+             raise HTTPException(status_code=404, detail="host not found")
+-        if user_id is not None and host.user_id != user_id:
++        is_admin = await _is_admin(user_id)
++        if user_id is not None and host.user_id != user_id and not is_admin:
+             raise HTTPException(status_code=403, detail="not your host")
+ 
+         conn = host_registry.get(host.host_id)
+@@ -1426,7 +1446,8 @@ def create_hosts_router(
+         host = await asyncio.to_thread(host_store.get_host, host_id)
+         if host is None:
+             raise HTTPException(status_code=404, detail="host not found")
+-        if user_id is not None and host.user_id != user_id:
++        is_admin = await _is_admin(user_id)
++        if user_id is not None and host.user_id != user_id and not is_admin:
+             raise HTTPException(status_code=403, detail="not your host")
+ 
+         conn = host_registry.get(host.host_id)
+@@ -1506,7 +1527,8 @@ def create_hosts_router(
+         host = await asyncio.to_thread(host_store.get_host, host_id)
+         if host is None:
+             raise HTTPException(status_code=404, detail="host not found")
+-        if user_id is not None and host.user_id != user_id:
++        is_admin = await _is_admin(user_id)
++        if user_id is not None and host.user_id != user_id and not is_admin:
+             raise HTTPException(status_code=403, detail="not your host")
+ 
+         conn = host_registry.get(host.host_id)
+@@ -1557,7 +1579,8 @@ def create_hosts_router(
+         host = await asyncio.to_thread(host_store.get_host, host_id)
+         if host is None:
+             raise HTTPException(status_code=404, detail="host not found")
+-        if user_id is not None and host.user_id != user_id:
++        is_admin = await _is_admin(user_id)
++        if user_id is not None and host.user_id != user_id and not is_admin:
+             raise HTTPException(status_code=403, detail="not your host")
+ 
+         if not path.strip():
+diff --git a/omnigent/server/routes/scheduled_tasks.py b/omnigent/server/routes/scheduled_tasks.py
+index ea98ba48f..10ae8f447 100644
+--- a/omnigent/server/routes/scheduled_tasks.py
++++ b/omnigent/server/routes/scheduled_tasks.py
+@@ -286,6 +286,7 @@ def create_scheduled_tasks_router(
+             workspace=workspace,
+             agent=agent,
+             agent_cache=agent_cache,
++            permission_store=permission_store,
+             host_store=getattr(request.app.state, "host_store", None),
+             host_registry=getattr(request.app.state, "host_registry", None),
+         )
+diff --git a/omnigent/server/scheduled/fire.py b/omnigent/server/scheduled/fire.py
+index a2250796d..2066586b2 100644
+--- a/omnigent/server/scheduled/fire.py
++++ b/omnigent/server/scheduled/fire.py
+@@ -790,6 +790,7 @@ async def _validate_fire_session_inputs(
+                 workspace=task.workspace,
+                 agent=agent,
+                 agent_cache=deps.agent_cache,
++                permission_store=deps.permission_store,
+                 host_store=deps.host_store,
+                 host_registry=deps.host_registry,
+             )
+diff --git a/omnigent/stores/host_store.py b/omnigent/stores/host_store.py
+index 2b914fc93..451bc687b 100644
+--- a/omnigent/stores/host_store.py
++++ b/omnigent/stores/host_store.py
+@@ -635,6 +635,23 @@ class HostStore:
+             )
+             return [_row_to_host(row) for row in rows]
+ 
++    def list_all_hosts(self) -> list[Host]:
++        """List all hosts across every user (admin view).
++
++        Returns both online and offline hosts for all users, ordered
++        by ``updated_at`` descending (most recently active first).
++
++        :returns: List of :class:`Host` entities.
++        """
++        with self._session("list_all_hosts") as session:
++            rows = (
++                session.query(SqlHost)
++                .filter(SqlHost.workspace_id == current_workspace_id())
++                .order_by(SqlHost.updated_at.desc())
++                .all()
++            )
++            return [_row_to_host(row) for row in rows]
++
+     def get_host(self, host_id: str) -> Host | None:
+         """
+         Fetch a single host by ID.
+diff --git a/tests/server/routes/test_host_launch.py b/tests/server/routes/test_host_launch.py
+index f6a8849e9..0bf5489e3 100644
+--- a/tests/server/routes/test_host_launch.py
++++ b/tests/server/routes/test_host_launch.py
+@@ -82,6 +82,23 @@ class TestResolveHostOwner:
+         result = resolve_host_owner(user_id=None, host_id="host_1", host_store=store)
+         assert result.host_id == "host_1"
+ 
++    def test_admin_bypasses_ownership(self) -> None:
++        # Bob owns the host; alice is an admin -> ownership waived.
++        host = _FakeHost(host_id="host_1", user_id="bob")
++        store = _FakeHostStore(hosts={"host_1": host})
++        result = resolve_host_owner(
++            user_id="alice", host_id="host_1", host_store=store, is_admin=True
++        )
++        assert result.host_id == "host_1"
++
++    def test_non_admin_still_403_on_others_host(self) -> None:
++        # is_admin default False: a plain user never bypasses ownership.
++        host = _FakeHost(host_id="host_1", user_id="bob")
++        store = _FakeHostStore(hosts={"host_1": host})
++        with pytest.raises(HTTPException) as exc_info:
++            resolve_host_owner(user_id="alice", host_id="host_1", host_store=store)
++        assert exc_info.value.status_code == 403
++
+ 
+ # ── resolve_host_launch ──────────────────────────────────────────────
+ 
+@@ -146,3 +163,63 @@ class TestResolveHostLaunch:
+         )
+         assert result.host.host_id == "host_1"
+         assert result.conv.id == "s1"
++
++    def test_admin_can_launch_on_other_users_host(self, monkeypatch) -> None:
++        import omnigent.server.routes._host_launch as hl
++
++        # Isolation: this test targets HOST authorization, so the session
++        # owner check is neutralized.
++        monkeypatch.setattr(hl, "check_session_access", lambda *a, **k: True)
++
++        class _FakePermStore:
++            def is_admin(self, user_id: str) -> bool:
++                return user_id == "alice"
++
++        host = _FakeHost(host_id="host_1", user_id="bob")  # bob's host
++        conn = object()
++        conv = Conversation(
++            id="s1", created_at=1, updated_at=1, root_conversation_id="s1", agent_id="ag_1"
++        )
++        store = _FakeHostStore(hosts={"host_1": host})
++        registry = _FakeHostRegistry(conns={"host_1": conn})
++        conv_store = _FakeConversationStore(convs={"s1": conv})
++        result = resolve_host_launch(
++            user_id="alice",  # admin
++            host_id="host_1",
++            session_id="s1",
++            host_store=store,
++            host_registry=registry,
++            conversation_store=conv_store,
++            permission_store=_FakePermStore(),
++        )
++        assert result.host.host_id == "host_1"
++        assert result.conv.id == "s1"
++
++    def test_non_admin_cannot_launch_on_other_users_host(self, monkeypatch) -> None:
++        import omnigent.server.routes._host_launch as hl
++
++        monkeypatch.setattr(hl, "check_session_access", lambda *a, **k: True)
++
++        class _FakePermStore:
++            def is_admin(self, user_id: str) -> bool:
++                return False
++
++        host = _FakeHost(host_id="host_1", user_id="bob")
++        conn = object()
++        conv = Conversation(
++            id="s1", created_at=1, updated_at=1, root_conversation_id="s1", agent_id="ag_1"
++        )
++        store = _FakeHostStore(hosts={"host_1": host})
++        registry = _FakeHostRegistry(conns={"host_1": conn})
++        conv_store = _FakeConversationStore(convs={"s1": conv})
++        with pytest.raises(HTTPException) as exc_info:
++            resolve_host_launch(
++                user_id="alice",
++                host_id="host_1",
++                session_id="s1",
++                host_store=store,
++                host_registry=registry,
++                conversation_store=conv_store,
++                permission_store=_FakePermStore(),
++            )
++        assert exc_info.value.status_code == 403
+diff --git a/tests/stores/test_host_store.py b/tests/stores/test_host_store.py
+index 078845caa..3e17455ff 100644
+--- a/tests/stores/test_host_store.py
++++ b/tests/stores/test_host_store.py
+@@ -76,6 +76,32 @@ def test_upsert_creates_host_on_first_connect(
+     assert fetched.status == "online"
+ 
+ 
++def test_list_all_hosts_returns_every_users_hosts(host_store: HostStore) -> None:
++    """
++    Verify that ``list_all_hosts`` spans every user (the admin view),
++    while ``list_hosts`` keeps filtering to a single owner.
++    """
++    host_store.upsert_on_connect(
++        host_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", name="alice-host", user_id="alice@example.com"
++    )
++    host_store.upsert_on_connect(
++        host_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", name="bob-host", user_id="bob@example.com"
++    )
++
++    all_hosts = host_store.list_all_hosts()
++    assert {h.host_id for h in all_hosts} == {
++        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
++    }
++    assert {h.user_id for h in all_hosts} == {"alice@example.com", "bob@example.com"}
++
++    # Per-user listing still filters to the owner only.
++    alice_hosts = host_store.list_hosts("alice@example.com")
++    assert [h.host_id for h in alice_hosts] == ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
++    bob_hosts = host_store.list_hosts("bob@example.com")
++    assert [h.host_id for h in bob_hosts] == ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
++
++
+ def test_upsert_updates_existing_host_on_reconnect(
+     host_store: HostStore,
+ ) -> None:
+-- 
+2.53.0
+
