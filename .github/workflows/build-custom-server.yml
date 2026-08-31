@@ -2,7 +2,7 @@ name: Build and Publish Custom Omnigent (Admin Shared Hosts)
 
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["CI", "Lint"]
     types:
       - completed
     branches:
@@ -19,16 +19,65 @@ on:
 permissions:
   contents: write
   packages: write
+  checks: read
 
 concurrency:
-  group: build-custom-omnigent-${{ github.ref }}
+  group: build-custom-omnigent-${{ github.event.workflow_run.head_sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  check-tests-gate:
+    name: Verify All Tests Passed (Gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_build: ${{ steps.gate.outputs.should_build }}
+    steps:
+      - name: Evaluate Check Runs Status
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "Manual dispatch: proceeding with build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Inspecting all check runs for commit ${HEAD_SHA}..."
+          CHECKS_JSON=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs")
+
+          # Check for any failed or timed-out check runs
+          FAILED_COUNT=$(echo "${CHECKS_JSON}" | jq '[.check_runs[] | select(.status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled"))] | length')
+
+          # Check if CI pytest or Pre-commit checks are still in progress
+          IN_PROGRESS_COUNT=$(echo "${CHECKS_JSON}" | jq '[.check_runs[] | select((.name == "Pre-commit checks" or (.name | startswith("Pytest"))) and .status != "completed")] | length')
+
+          echo "Failed checks: ${FAILED_COUNT}"
+          echo "In-progress core tests: ${IN_PROGRESS_COUNT}"
+
+          if [ "${FAILED_COUNT}" -gt 0 ]; then
+            echo "❌ Tests or lint failed on this commit. Skipping build to avoid wasting compute."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${IN_PROGRESS_COUNT}" -gt 0 ]; then
+            echo "⏳ Core test shards are still in-progress. Waiting for final workflow completion."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "✅ All tests passed (or skipped/neutral)! Proceeding to build and publish."
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
   build-wheels:
     name: Build Python Wheels & Web UI
-    # Only start if CI succeeded (or manually triggered); zero compute wasted on red tests
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs: [check-tests-gate]
+    if: ${{ needs.check-tests-gate.outputs.should_build == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -93,8 +142,8 @@ jobs:
 
   build-and-push-docker:
     name: Build & Push Docker Images
-    needs: [build-wheels]
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs: [check-tests-gate, build-wheels]
+    if: ${{ needs.check-tests-gate.outputs.should_build == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
