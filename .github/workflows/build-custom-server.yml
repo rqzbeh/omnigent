@@ -1,0 +1,149 @@
+name: Build and Publish Custom Omnigent (Admin Shared Hosts)
+
+on:
+  push:
+    branches:
+      - 'v0.11.0-admin-shared-hosts'
+      - 'v0.11.0-admin-hosts'
+    tags:
+      - 'v0.11.0-admin*'
+  workflow_dispatch:
+    inputs:
+      push_images:
+        description: 'Push Docker images to GHCR'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build-custom-omnigent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheels:
+    name: Build Python Wheels & Web UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+
+      - name: Set up Node and pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          standalone: true
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Build Web UI bundle
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          rm -rf omnigent/server/static/web-ui
+          pnpm install --frozen-lockfile --filter web
+          pnpm --filter web run build
+
+      - name: Build sdists and wheels
+        run: |
+          uv build --out-dir dist
+          uv build sdks/python-client --out-dir dist
+          uv build sdks/ui --out-dir dist
+          ls -la dist/
+
+      - name: Verify Web UI bundled into wheel
+        run: |
+          uv run --no-project python - <<'PY'
+          import glob, sys, zipfile
+          whls = sorted(glob.glob("dist/omnigent-*.whl"))
+          if not whls:
+              sys.exit("No core omnigent wheel found in dist/")
+          whl = whls[-1]
+          names = zipfile.ZipFile(whl).namelist()
+          ui = [n for n in names if "server/static/web-ui/" in n]
+          has_index = any(n.endswith("server/static/web-ui/index.html") for n in ui)
+          print(f"{whl}: {len(ui)} web-ui files, index.html present = {has_index}")
+          sys.exit(0 if (ui and has_index) else "WEB-UI BUNDLE MISSING FROM WHEEL")
+          PY
+
+      - name: Upload Wheels Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omnigent-wheels-v0.11.0-admin-hosts
+          path: dist/
+          retention-days: 90
+
+  build-and-push-docker:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_images }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${REPO_OWNER}/omnigent-server"
+          HOST_IMAGE="ghcr.io/${REPO_OWNER}/omnigent-host"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+
+          TAGS="${IMAGE}:v0.11.0-admin-hosts,${IMAGE}:v0.11.0-admin-shared-hosts,${IMAGE}:latest-admin-hosts,${IMAGE}:sha-${SHORT_SHA}"
+          HOST_TAGS="${HOST_IMAGE}:v0.11.0-admin-hosts,${HOST_IMAGE}:v0.11.0-admin-shared-hosts,${HOST_IMAGE}:latest-admin-hosts,${HOST_IMAGE}:sha-${SHORT_SHA}"
+
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "host_tags=${HOST_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Building with tags: ${TAGS}"
+
+      - name: Build and push Server image (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_images }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Build and push Host image (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: host
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_images }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.host_tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
