@@ -38,10 +38,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch Upstream Tags
+      - name: Fetch Upstream Tags and Commits
         run: |
           git remote add upstream https://github.com/omnigent-ai/omnigent.git || true
           git fetch upstream --tags
+          git fetch upstream main
 
       - name: Determine Target Release Tag
         id: target
@@ -73,7 +74,7 @@ jobs:
             echo "New upstream release detected: ${TARGET_TAG}"
           fi
 
-      - name: Attempt Automatic Patch Rebase
+      - name: Attempt Automatic Cherry-Pick
         if: steps.check_current.outputs.already_synced == 'false'
         id: rebase
         run: |
@@ -81,20 +82,27 @@ jobs:
           TARGET_TAG="${{ steps.target.outputs.tag }}"
           NEW_BRANCH="sync-${TARGET_TAG}"
 
+          # Identify custom admin commit SHAs from main history
+          COMMIT_ADMIN=$(git log --grep="feat(hosts): admin role gets access to all shared hosts" -n 1 --format="%H" main)
+          COMMIT_PERM=$(git log --grep="fix(server): wire permission_store into app.state" -n 1 --format="%H" main)
+
+          echo "Target tag: ${TARGET_TAG}"
+          echo "Admin commit: ${COMMIT_ADMIN}"
+          echo "Permission wire commit: ${COMMIT_PERM}"
+
           git checkout -B "${NEW_BRANCH}" "${TARGET_TAG}"
 
-          # Ensure patches directory exists in workspace
-          git checkout main -- patches/ .github/workflows/
-
-          echo "Applying admin host sharing patches..."
-          if git apply patches/0001-*.patch patches/0002-*.patch; then
-            git add .
-            git commit -m "feat(hosts): admin role gets access to all shared hosts (rebased on ${TARGET_TAG})"
+          echo "Cherry-picking custom commits onto ${TARGET_TAG}..."
+          if git cherry-pick "${COMMIT_ADMIN}" && git cherry-pick "${COMMIT_PERM}"; then
+            # Bring over custom workflows
+            git checkout main -- .github/workflows/
+            git add .github/workflows/
+            git commit -m "ci: include custom build and sync workflows for ${TARGET_TAG}" || true
             git push origin "${NEW_BRANCH}" --force
             echo "conflict=false" >> "$GITHUB_OUTPUT"
           else
             echo "conflict=true" >> "$GITHUB_OUTPUT"
-            echo "Conflict occurred while applying patches onto ${TARGET_TAG}"
+            echo "Conflict occurred while cherry-picking onto ${TARGET_TAG}"
           fi
 
       - name: Open Pull Request on Success
