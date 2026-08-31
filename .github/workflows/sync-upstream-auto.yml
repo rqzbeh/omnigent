@@ -15,7 +15,7 @@ on:
 permissions:
   contents: write
   packages: write
-  pull_requests: write
+  pull-requests: write
   issues: write
 
 concurrency:
