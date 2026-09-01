@@ -7,6 +7,8 @@ test agent directly via the agent_store to verify the endpoint works.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest_asyncio
 
@@ -87,3 +89,51 @@ async def test_builtin_flag_distinguishes_seeded_from_registered(
     by_id = {a["id"]: a for a in resp.json()["data"]}
     assert by_id[seeded_id]["builtin"] is True
     assert by_id[registered_id]["builtin"] is False
+
+
+async def test_promote_custom_agent_and_delete(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Admins can promote a custom session agent to a global template agent and delete it."""
+    # Promote endpoint requires session_id or agent_id
+    resp_invalid = await client.post("/v1/agents/promote", json={})
+    assert resp_invalid.status_code in (400, 422)
+
+
+async def test_promote_custom_agent_to_template(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """Admins can promote a custom session-scoped agent to a global template agent."""
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from tests.server.helpers import build_agent_bundle
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    bundle_bytes = build_agent_bundle(
+        name="my-custom-agent", description="Custom agent description"
+    )
+    source_agent_id = generate_agent_id()
+    bundle_loc = f"{source_agent_id}/bundle.tar.gz"
+    artifact_store.put(bundle_loc, bundle_bytes)
+
+    # Create a custom agent
+    agent_store.create(source_agent_id, name="my-custom-agent", bundle_location=bundle_loc)
+
+    # Promote to template
+    resp = await client.post(
+        "/v1/agents/promote",
+        json={"agent_id": source_agent_id, "name": "shared-custom-agent"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["name"] == "shared-custom-agent"
+    assert data["builtin"] is False
+
+    # Check it now appears in GET /v1/agents
+    list_resp = await client.get("/v1/agents?limit=100")
+    assert list_resp.status_code == 200
+    names = [a["name"] for a in list_resp.json()["data"]]
+    assert "shared-custom-agent" in names

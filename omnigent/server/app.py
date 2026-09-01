@@ -498,7 +498,7 @@ def _ensure_builtin_agent(
             # row, so a legacy ``ag_``-prefixed value is what the loader reads.
             if not artifact_store.exists(existing.bundle_location):
                 artifact_store.put(existing.bundle_location, bundle_bytes)
-            # Evict so a lagging replica's stale cache reloads the bundle.
+            # Row current; evict so a lagging replica's stale cache reloads the bundle.
             agent_cache.evict(existing.id)
             return
         artifact_store.put(new_loc, bundle_bytes)
@@ -559,63 +559,95 @@ def _ensure_default_agents(
 _EXTRA_BUILTIN_AGENTS_ENV = "OMNIGENT_BUILTIN_AGENT_DIRS"
 
 
+def _register_single_extra_agent(
+    source: Path,
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    import tempfile
+
+    from omnigent.spec import materialize_bundle
+
+    name = source.stem if source.is_file() else source.name
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
+        bundle_bytes = _tar_gz_dir(bundle_dir)
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=name,
+        bundle_bytes=bundle_bytes,
+    )
+    _logger.info("Registered extra built-in agent %r from %s", name, source)
+
+
 def _ensure_extra_builtin_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
 ) -> None:
     """
-    Seed extra built-in agents named by :data:`_EXTRA_BUILTIN_AGENTS_ENV`.
+    Seed extra built-in agents named by :data:`_EXTRA_BUILTIN_AGENTS_ENV`
+    or found in standard agent directories (e.g. ``/data/agents``).
 
-    No-op when the env var is unset. Each entry is materialized into a
-    bundle, tarballed, and registered via :func:`_ensure_builtin_agent`
-    (content-aware / idempotent), so a redeploy refreshes a changed spec.
-    The built-in's name is the entry path's stem (single-file spec) or
-    directory name (bundle dir).
-
-    Unlike the packaged ``_ensure_default_*`` helpers, this reads
-    operator-supplied paths that may be wrong in a deployment (typo, stale
-    mount). A bad entry is logged and skipped — one misconfigured extra
-    agent must never block server startup (the packaged built-ins still
-    seed). Mirrors the best-effort spec-load in :func:`_to_agent_object`.
+    Each entry is materialized into a bundle, tarballed, and registered via
+    :func:`_ensure_builtin_agent` (content-aware / idempotent), so a redeploy
+    refreshes a changed spec. The built-in's name is the entry path's stem
+    (single-file spec) or directory name (bundle dir).
 
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    import tempfile
-
-    from omnigent.spec import materialize_bundle
-
     raw = os.environ.get(_EXTRA_BUILTIN_AGENTS_ENV, "").strip()
-    if not raw:
-        return
-    for entry in raw.split(os.pathsep):
-        entry = entry.strip()
-        if not entry:
+    sources: list[Path] = []
+    if raw:
+        for entry in raw.split(os.pathsep):
+            entry = entry.strip()
+            if entry:
+                sources.append(Path(entry))
+    else:
+        # Default standard custom agents directory if present and non-empty
+        default_data_agents = Path("/data/agents")
+        if default_data_agents.is_dir():
+            sources.append(default_data_agents)
+
+    for source in sources:
+        if not source.exists():
             continue
-        source = Path(entry)
-        try:
-            name = source.stem if source.is_file() else source.name
-            with tempfile.TemporaryDirectory() as tmpdir:
-                bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
-                bundle_bytes = _tar_gz_dir(bundle_dir)
-            _ensure_builtin_agent(
-                agent_store,
-                artifact_store,
-                agent_cache,
-                name=name,
-                bundle_bytes=bundle_bytes,
-            )
-        except Exception:  # a bad operator path must not block server startup
-            _logger.exception(
-                "Failed to register extra built-in agent from %r (%s); skipping. Check %s.",
-                str(source),
-                "does not exist" if not source.exists() else "invalid spec/bundle",
-                _EXTRA_BUILTIN_AGENTS_ENV,
-            )
-            continue
-        _logger.info("Registered extra built-in agent %r from %s", name, source)
+        # If source is a container directory with multiple agent files/subdirs
+        if (
+            source.is_dir()
+            and not (source / "config.yaml").exists()
+            and not (source / "agent.yaml").exists()
+            and any(source.iterdir())
+        ):
+            for child in sorted(source.iterdir()):
+                if child.name.startswith("."):
+                    continue
+                if (
+                    child.is_file() and child.suffix.lower() in {".yaml", ".yml"}
+                ) or child.is_dir():
+                    try:
+                        _register_single_extra_agent(
+                            child, agent_store, artifact_store, agent_cache
+                        )
+                    except Exception:
+                        _logger.exception(
+                            "Failed to register extra built-in agent from %r", str(child)
+                        )
+        else:
+            try:
+                _register_single_extra_agent(source, agent_store, artifact_store, agent_cache)
+            except Exception:
+                _logger.exception(
+                    "Failed to register extra built-in agent from %r (%s); skipping. Check %s.",
+                    str(source),
+                    "does not exist" if not source.exists() else "invalid spec/bundle",
+                    _EXTRA_BUILTIN_AGENTS_ENV,
+                )
 
 
 def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
@@ -2316,7 +2348,7 @@ def create_app(
         prefix="/v1",
         tags=["usage"],
     )
-    # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
+    # Read and management for built-in and template agents (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
     # built-in (session_id IS NULL) agents for the new-session picker.
     app.include_router(
@@ -2324,6 +2356,9 @@ def create_app(
             agent_store,
             agent_cache,
             auth_provider=auth_provider,
+            artifact_store=artifact_store,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
         ),
         prefix="/v1",
         tags=["agents"],

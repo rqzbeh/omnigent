@@ -206,7 +206,9 @@ ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:${PATH}" \
-    IS_SANDBOX=1
+    IS_SANDBOX=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    ENABLE_TOOL_SEARCH=1
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -253,6 +255,14 @@ RUN npm install -g --no-audit --no-fund \
       @openai/codex \
       @earendil-works/pi-coding-agent \
  && npm cache clean --force
+
+# Pre-configure default non-interactive settings for Claude Code and Codex
+# so they don't block on terminal onboarding or permission dialogs inside container environments.
+RUN mkdir -p /etc/claude-code /root/.claude /sandbox/.claude /root/.codex /sandbox/.codex \
+ && printf '{\n  "hasCompletedOnboarding": true,\n  "skipAutoPermissionPrompt": true,\n  "theme": "dark"\n}\n' > /etc/claude-code/managed-settings.json \
+ && printf '{\n  "hasCompletedOnboarding": true,\n  "skipAutoPermissionPrompt": true,\n  "theme": "dark"\n}\n' > /root/.claude/settings.json \
+ && printf '{\n  "hasCompletedOnboarding": true,\n  "skipAutoPermissionPrompt": true,\n  "theme": "dark"\n}\n' > /sandbox/.claude/settings.json \
+ && chown -R sandbox:sandbox /sandbox/.claude /sandbox/.codex
 
 # Kiro CLI is not published as an npm package, and its installer has NO version
 # flag — `curl …/install | bash` always fetches `latest`, so the image was

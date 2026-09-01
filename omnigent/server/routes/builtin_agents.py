@@ -1,38 +1,71 @@
-"""Read-only route for discovering built-in agents (``GET /v1/agents``).
+"""Read and management routes for built-in and template agents (``/v1/agents``).
 
 Built-in agents are the long-lived, shared agents the server provides
 out of the box — the seeded ``claude-native-ui`` agent plus anything
-registered at startup with ``omnigent server --agent``. They are the
+registered at startup with ``omnigent server --agent`` or promoted
+by administrators via ``POST /v1/agents/promote``. They are the
 ``session_id IS NULL`` rows in ``agent_store``; ``agent_store.list()``
-already filters to exactly these. Session-scoped agents (created via
+filters to exactly these. Session-scoped agents (created via
 multipart ``POST /v1/sessions``) belong to one conversation and are read
-through ``GET /v1/sessions/{id}/agent`` — never here.
+through ``GET /v1/sessions/{id}/agent``.
 
 The Web UI's new-session picker calls this to discover bindable
 built-ins, then creates a session with
 ``POST /v1/sessions {agent_id, host_id, workspace}``. See
 ``designs/BUILTIN_AGENTS.md``.
-
-This is the read-only successor to the removed ``GET /api/agents`` list:
-there is intentionally no create/update/delete — agent writes happen
-through session creation.
 """
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel
 
-from omnigent.db.utils import builtin_agent_id
+from omnigent.db.utils import builtin_agent_id, generate_agent_id
 from omnigent.entities import Agent
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
+from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.schemas import AgentObject, MCPServerSummary, PaginatedList, SkillSummary
-from omnigent.stores import AgentStore
+from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
+
+
+class AgentPromoteRequest(BaseModel):
+    """Request payload to promote a custom/session agent to a global template."""
+
+    agent_id: str | None = None
+    session_id: str | None = None
+    name: str | None = None
+    description: str | None = None
+
+
+async def _require_admin(
+    request: Request,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+) -> None:
+    """Verify caller has admin privileges."""
+    if permission_store is None:
+        return
+    user_id = get_user_id(request, auth_provider)
+    if user_id is None:
+        raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)
+    is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
+    if not is_admin:
+        raise OmnigentError(
+            "Admin privileges required to manage template agents",
+            code=ErrorCode.FORBIDDEN,
+        )
 
 
 def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
@@ -123,8 +156,11 @@ def create_builtin_agents_router(
     agent_cache: AgentCache,
     *,
     auth_provider: AuthProvider | None = None,
+    artifact_store: ArtifactStore | None = None,
+    permission_store: PermissionStore | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> APIRouter:
-    """Build the router for ``GET /v1/agents`` (built-in discovery).
+    """Build the router for ``/v1/agents`` (built-in & template agents).
 
     Mounted with ``prefix="/v1"`` so the final path is ``/v1/agents``.
 
@@ -134,7 +170,10 @@ def create_builtin_agents_router(
         ``mcp_servers`` on each agent).
     :param auth_provider: Optional auth provider; when set, the caller
         must be authenticated.
-    :returns: A FastAPI router exposing the read-only list.
+    :param artifact_store: Optional artifact store for promoting agent bundles.
+    :param permission_store: Optional permission store for admin check.
+    :param conversation_store: Optional conversation store for resolving session agents.
+    :returns: A FastAPI router exposing discovery and admin promotion endpoints.
     """
     router = APIRouter()
 
@@ -166,5 +205,102 @@ def create_builtin_agents_router(
             last_id=page.last_id,
             has_more=page.has_more,
         )
+
+    @router.post("/agents/promote")
+    async def promote_agent_to_template(
+        request: Request,
+        body: AgentPromoteRequest,
+    ) -> AgentObject:
+        """Promote a custom/session-scoped agent to a global template agent (Admin only)."""
+        await _require_admin(request, auth_provider, permission_store)
+
+        if artifact_store is None:
+            raise OmnigentError("Artifact store not configured", code=ErrorCode.INTERNAL_ERROR)
+
+        source_agent_id = body.agent_id
+        if not source_agent_id and body.session_id and conversation_store is not None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, body.session_id)
+            if conv is not None and conv.agent_id:
+                source_agent_id = conv.agent_id
+
+        if not source_agent_id:
+            raise OmnigentError(
+                "Either agent_id or session_id must be provided",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        source_agent = await asyncio.to_thread(agent_store.get, source_agent_id)
+        if source_agent is None:
+            raise OmnigentError(f"Agent {source_agent_id!r} not found", code=ErrorCode.NOT_FOUND)
+
+        try:
+            bundle_bytes = await asyncio.to_thread(
+                artifact_store.get, source_agent.bundle_location
+            )
+        except Exception as exc:
+            raise OmnigentError(
+                f"Failed to read source agent bundle: {exc}",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
+
+        target_name = (body.name or source_agent.name).strip()
+        target_description = (
+            body.description if body.description is not None else source_agent.description
+        )
+
+        bundle_hash = hashlib.sha256(bundle_bytes).hexdigest()
+        existing_template = await asyncio.to_thread(agent_store.get_by_name, target_name)
+
+        if existing_template is not None:
+            new_loc = f"{existing_template.id}/{bundle_hash}"
+            await asyncio.to_thread(artifact_store.put, new_loc, bundle_bytes)
+            updated_agent = await asyncio.to_thread(
+                agent_store.update, existing_template.id, new_loc
+            )
+            if updated_agent is not None:
+                agent_cache.replace(existing_template.id, new_loc, bundle_bytes, expand_env=True)
+                return _to_agent_object(updated_agent, agent_cache)
+
+        template_agent_id = generate_agent_id()
+        bundle_key = f"{template_agent_id}/{bundle_hash}"
+        await asyncio.to_thread(artifact_store.put, bundle_key, bundle_bytes)
+        created_agent = await asyncio.to_thread(
+            agent_store.create,
+            template_agent_id,
+            target_name,
+            bundle_key,
+            description=target_description,
+        )
+        agent_cache.evict(template_agent_id)
+        return _to_agent_object(created_agent, agent_cache)
+
+    @router.delete("/agents/{agent_id}")
+    async def delete_template_agent(
+        request: Request,
+        agent_id: str,
+    ) -> dict[str, Any]:
+        """Delete a custom registered template agent (Admin only)."""
+        await _require_admin(request, auth_provider, permission_store)
+
+        agent = await asyncio.to_thread(agent_store.get, agent_id)
+        if agent is None:
+            raise OmnigentError(f"Agent {agent_id!r} not found", code=ErrorCode.NOT_FOUND)
+
+        if agent.session_id is not None:
+            raise OmnigentError(
+                "Cannot delete session-scoped agent through template endpoint",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        # Protect core seeded built-ins from accidental deletion
+        if agent.id == builtin_agent_id(agent.name):
+            raise OmnigentError(
+                f"Cannot delete core seeded built-in agent {agent.name!r}",
+                code=ErrorCode.FORBIDDEN,
+            )
+
+        deleted = await asyncio.to_thread(agent_store.delete, agent_id)
+        agent_cache.evict(agent_id)
+        return {"deleted": deleted, "id": agent_id}
 
     return router

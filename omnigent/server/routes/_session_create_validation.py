@@ -425,6 +425,7 @@ async def validate_existing_host_workspace(
                 agent_cache.load,
                 agent.id,
                 agent.bundle_location,
+                expand_env=agent.session_id is None,
             )
             os_env = getattr(loaded.spec, "os_env", None)
             spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None
