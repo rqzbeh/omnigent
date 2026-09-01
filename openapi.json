@@ -170,6 +170,57 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "AgentPromoteRequest": {
+        "description": "Request payload to promote a custom/session agent to a global template.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          }
+        },
+        "title": "AgentPromoteRequest",
+        "type": "object"
+      },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
         "description": "Request body for the current-agent automatic rename endpoint.",
@@ -8258,6 +8309,93 @@
           }
         },
         "summary": "List Builtin Agents",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/v1/agents/promote": {
+      "post": {
+        "description": "Promote a custom/session-scoped agent to a global template agent (Admin only).",
+        "operationId": "promote_agent_to_template_v1_agents_promote_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentPromoteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Promote Agent To Template",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/v1/agents/{agent_id}": {
+      "delete": {
+        "description": "Delete a custom registered template agent (Admin only).",
+        "operationId": "delete_template_agent_v1_agents__agent_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Template Agent V1 Agents  Agent Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Template Agent",
         "tags": [
           "agents"
         ]
