@@ -226,7 +226,7 @@ jobs:
 
   deploy:
     needs: build
-    if: secrets.DATABRICKS_HOST != '' && secrets.DATABRICKS_CLIENT_ID != ''
+    if: github.repository == 'omnigent-ai/omnigent'
     # Gate the secret-bearing deploy behind a protected Environment for
     # UNTRUSTED fork PRs only: a labelled outside-contributor fork PR that gets a
     # new commit must wait for a human reviewer to approve this run before it can
