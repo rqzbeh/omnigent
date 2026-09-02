@@ -100,11 +100,14 @@ jobs:
 
   build:
     if: >-
-      github.event_name == 'push'
-      || (
-        github.event.action != 'closed'
-        && contains(github.event.pull_request.labels.*.name, 'ui-preview')
-        && github.event.pull_request.draft == false
+      github.repository == 'omnigent-ai/omnigent'
+      && (
+        github.event_name == 'push'
+        || (
+          github.event.action != 'closed'
+          && contains(github.event.pull_request.labels.*.name, 'ui-preview')
+          && github.event.pull_request.draft == false
+        )
       )
     runs-on: ubuntu-latest
     permissions:
