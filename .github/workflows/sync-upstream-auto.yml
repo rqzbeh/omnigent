@@ -11,6 +11,11 @@ on:
         required: false
         default: ''
         type: string
+      auto_merge_main:
+        description: 'Automatically fast-forward / update main on clean sync'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -41,7 +46,7 @@ jobs:
       - name: Fetch Upstream Tags and Commits
         run: |
           git remote add upstream https://github.com/omnigent-ai/omnigent.git || true
-          git fetch upstream --tags
+          git fetch upstream --tags --force
           git fetch upstream main
 
       - name: Determine Target Release Tag
@@ -64,7 +69,6 @@ jobs:
         run: |
           set -euo pipefail
           TARGET_TAG="${{ steps.target.outputs.tag }}"
-          # Check if the target tag commit is already an ancestor of main
           TARGET_COMMIT=$(git rev-parse "${TARGET_TAG}")
           if git merge-base --is-ancestor "${TARGET_COMMIT}" HEAD; then
             echo "already_synced=true" >> "$GITHUB_OUTPUT"
@@ -74,7 +78,7 @@ jobs:
             echo "New upstream release detected: ${TARGET_TAG}"
           fi
 
-      - name: Attempt Automatic Cherry-Pick
+      - name: Attempt Automatic Rebase / Cherry-Pick
         if: steps.check_current.outputs.already_synced == 'false'
         id: rebase
         run: |
@@ -82,31 +86,53 @@ jobs:
           TARGET_TAG="${{ steps.target.outputs.tag }}"
           NEW_BRANCH="sync-${TARGET_TAG}"
 
-          # Identify custom admin commit SHAs from main history
-          COMMIT_ADMIN=$(git log --grep="feat(hosts): admin role gets access to all shared hosts" -n 1 --format="%H" main)
-          COMMIT_PERM=$(git log --grep="fix(server): wire permission_store into app.state" -n 1 --format="%H" main)
+          PREV_BASE=$(git merge-base "${TARGET_TAG}" main || git merge-base upstream/main main)
+          echo "Previous common base: ${PREV_BASE}"
 
-          echo "Target tag: ${TARGET_TAG}"
-          echo "Admin commit: ${COMMIT_ADMIN}"
-          echo "Permission wire commit: ${COMMIT_PERM}"
+          COMMITS=$(git rev-list --reverse "${PREV_BASE}..main")
+          echo "Custom commits to apply:"
+          echo "${COMMITS}"
 
           git checkout -B "${NEW_BRANCH}" "${TARGET_TAG}"
 
-          echo "Cherry-picking custom commits onto ${TARGET_TAG}..."
-          if git cherry-pick "${COMMIT_ADMIN}" && git cherry-pick "${COMMIT_PERM}"; then
-            # Bring over custom workflows
-            git checkout main -- .github/workflows/
-            git add .github/workflows/
-            git commit -m "ci: include custom build and sync workflows for ${TARGET_TAG}" || true
+          CONFLICT=false
+          for commit in ${COMMITS}; do
+            COMMIT_MSG=$(git log -1 --format="%s" "${commit}")
+            echo "Applying ${commit}: ${COMMIT_MSG}"
+            if ! git cherry-pick "${commit}"; then
+              echo "Conflict encountered applying ${commit}"
+              git cherry-pick --abort || true
+              CONFLICT=true
+              break
+            fi
+          done
+
+          if [ "${CONFLICT}" = "false" ]; then
+            # Ensure custom workflows are present
+            git checkout main -- .github/workflows/ || true
+            if [ -n "$(git status --porcelain .github/workflows/)" ]; then
+              git add .github/workflows/
+              git commit -m "ci: ensure custom workflows for ${TARGET_TAG}" || true
+            fi
             git push origin "${NEW_BRANCH}" --force
             echo "conflict=false" >> "$GITHUB_OUTPUT"
           else
             echo "conflict=true" >> "$GITHUB_OUTPUT"
-            echo "Conflict occurred while cherry-picking onto ${TARGET_TAG}"
           fi
 
-      - name: Open Pull Request on Success
-        if: steps.check_current.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'false'
+      - name: Update main branch if auto_merge_main is true
+        if: steps.check_current.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'false' && (github.event.inputs.auto_merge_main != 'false')
+        run: |
+          set -euo pipefail
+          TARGET_TAG="${{ steps.target.outputs.tag }}"
+          NEW_BRANCH="sync-${TARGET_TAG}"
+          echo "Fast-forwarding main to ${NEW_BRANCH}..."
+          git checkout main
+          git reset --hard "${NEW_BRANCH}"
+          git push origin main --force
+
+      - name: Open Pull Request on Clean Sync (if not fast-forwarded to main)
+        if: steps.check_current.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'false' && github.event.inputs.auto_merge_main == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -116,8 +142,8 @@ jobs:
           gh pr create \
             --base main \
             --head "${NEW_BRANCH}" \
-            --title "Automated Sync: Rebase Admin Host Sharing patches onto ${TARGET_TAG}" \
-            --body "Automated sync detected a new upstream release \`${TARGET_TAG}\`. The custom admin host sharing patches applied cleanly with 0 conflicts and the branch \`${NEW_BRANCH}\` has been pushed." || true
+            --title "Automated Sync: Rebase custom patches onto ${TARGET_TAG}" \
+            --body "Automated sync detected a new upstream release \`${TARGET_TAG}\`. All custom patches applied cleanly with 0 conflicts and branch \`${NEW_BRANCH}\` has been pushed." || true
 
       - name: Open Issue on Conflict
         if: steps.check_current.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'true'
@@ -128,4 +154,4 @@ jobs:
           TARGET_TAG="${{ steps.target.outputs.tag }}"
           gh issue create \
             --title "⚠️ Upstream Sync Conflict with ${TARGET_TAG}" \
-            --body "Automated sync attempted to rebase custom admin host sharing patches onto \`${TARGET_TAG}\`, but encountered merge/patch conflicts. Manual resolution is required."
+            --body "Automated sync attempted to rebase custom patches onto \`${TARGET_TAG}\`, but encountered merge/patch conflicts. Manual resolution is required."
