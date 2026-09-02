@@ -12,9 +12,10 @@
 
 /** Per-type upload size limits, in megabytes. Mirrors the server caps. */
 export const ATTACHMENT_SIZE_LIMITS_MB = {
-  image: 5,
-  pdf: 20,
-  text: 10,
+  image: 50,
+  pdf: 100,
+  text: 100,
+  other: 250,
 } as const;
 
 export type AttachmentCategory = keyof typeof ATTACHMENT_SIZE_LIMITS_MB;
@@ -118,12 +119,11 @@ function extensionOf(filename: string): string {
 }
 
 /**
- * Classify a file into an attachment category, or `null` if its type is not
- * supported (e.g. pptx, docx, xlsx, zip, binaries). Uses the browser MIME
+ * Classify a file into an attachment category. Uses the browser MIME
  * type first, falling back to the filename extension for code/text files
- * whose MIME is unreliable.
+ * whose MIME is unreliable, and defaults to "other" for arbitrary files.
  */
-export function classifyAttachment(file: File): AttachmentCategory | null {
+export function classifyAttachment(file: File): AttachmentCategory {
   const type = file.type || "";
   const ext = extensionOf(file.name || "");
 
@@ -136,7 +136,7 @@ export function classifyAttachment(file: File): AttachmentCategory | null {
   ) {
     return "text";
   }
-  return null;
+  return "other";
 }
 
 export interface AttachmentValidation {
@@ -148,8 +148,7 @@ export interface AttachmentValidation {
 
 /**
  * Split *files* into accepted attachments and rejection messages. A file is
- * rejected when its type is unsupported, or when it exceeds the per-type
- * size limit.
+ * rejected when it exceeds the per-type size limit.
  */
 export function validateAttachments(files: File[]): AttachmentValidation {
   const accepted: File[] = [];
@@ -158,12 +157,6 @@ export function validateAttachments(files: File[]): AttachmentValidation {
   for (const file of files) {
     const name = file.name || "file";
     const category = classifyAttachment(file);
-    if (category === null) {
-      errors.push(
-        `"${name}" can't be attached — only images, PDF, and text/code files are supported.`,
-      );
-      continue;
-    }
     const limitMb = ATTACHMENT_SIZE_LIMITS_MB[category];
     if (file.size > limitMb * 1024 * 1024) {
       errors.push(`"${name}" is too large — the limit for ${category} files is ${limitMb} MB.`);

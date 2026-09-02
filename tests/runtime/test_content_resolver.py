@@ -936,16 +936,16 @@ def test_resolve_image_file_keeps_specific_mime(
 @pytest.mark.parametrize(
     ("content_type", "expected_mb"),
     [
-        ("image/png", 5),
-        ("image/jpeg", 5),
-        ("image/webp", 5),
-        ("application/pdf", 20),
-        ("text/plain", 10),
-        ("text/markdown", 10),
-        ("text/x-python", 10),
-        ("text/typescript", 10),
-        ("application/json", 10),
-        ("application/x-ipynb+json", 10),
+        ("image/png", 50),
+        ("image/jpeg", 50),
+        ("image/webp", 50),
+        ("application/pdf", 100),
+        ("text/plain", 100),
+        ("text/markdown", 100),
+        ("text/x-python", 100),
+        ("text/typescript", 100),
+        ("application/json", 100),
+        ("application/x-ipynb+json", 100),
     ],
 )
 def test_attachment_upload_limit_allowed_types(content_type: str, expected_mb: int) -> None:
@@ -967,11 +967,14 @@ def test_attachment_upload_limit_allowed_types(content_type: str, expected_mb: i
         "video/mp4",
     ],
 )
-def test_attachment_upload_limit_rejects_unsupported_types(content_type: str) -> None:
-    """Office/binary/media types are not uploadable (None ⇒ caller 415s)."""
-    from omnigent.runtime.content_resolver import attachment_upload_limit
+def test_attachment_upload_limit_allows_arbitrary_types(content_type: str) -> None:
+    """Office/binary/media types are uploadable under global attachment ceiling."""
+    from omnigent.runtime.content_resolver import (
+        MAX_ATTACHMENT_UPLOAD_BYTES,
+        attachment_upload_limit,
+    )
 
-    assert attachment_upload_limit(content_type) is None
+    assert attachment_upload_limit(content_type) == MAX_ATTACHMENT_UPLOAD_BYTES
 
 
 def test_attachment_upload_limits_are_under_global_ceiling() -> None:

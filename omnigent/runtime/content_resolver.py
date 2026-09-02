@@ -100,10 +100,10 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
 # single attachment usable across a multi-turn conversation; the global
 # ceiling backstops the total request size after base64 inflation (~1.33x).
 # Mirrored client-side in web/src/lib/attachments.ts — keep in sync.
-MAX_IMAGE_UPLOAD_BYTES: int = 5 * 1024 * 1024
-MAX_PDF_UPLOAD_BYTES: int = 20 * 1024 * 1024
-MAX_TEXT_UPLOAD_BYTES: int = 10 * 1024 * 1024
-MAX_ATTACHMENT_UPLOAD_BYTES: int = 25 * 1024 * 1024
+MAX_IMAGE_UPLOAD_BYTES: int = 50 * 1024 * 1024
+MAX_PDF_UPLOAD_BYTES: int = 100 * 1024 * 1024
+MAX_TEXT_UPLOAD_BYTES: int = 100 * 1024 * 1024
+MAX_ATTACHMENT_UPLOAD_BYTES: int = 250 * 1024 * 1024
 
 # Copy-at-spawn limits (see the ``files:copy`` endpoint). A parent forwarding
 # files to a subagent copies them through the server, which reads each source
@@ -132,25 +132,15 @@ _TEXT_LIKE_APPLICATION_MIMES: frozenset[str] = frozenset(
 )
 
 
-def attachment_upload_limit(content_type: str) -> int | None:
+def attachment_upload_limit(content_type: str) -> int:
     """
-    Max upload size (bytes) for *content_type*, or ``None`` if the type is
-    not an allowed attachment.
+    Max upload size (bytes) for *content_type*.
 
-    Allowed: images, PDF, and text-like files (``text/*`` plus a few
-    text-bearing ``application/*`` types — JSON, JS, JSONL, notebooks).
-    Office / binary formats (pptx, docx, xlsx, zip, …) return ``None`` and
-    are rejected at upload: the model can't read their raw bytes
-    (Anthropic's base64 ``document`` source accepts only PDF), so inlining
-    them only produces garbled UTF-8 or — for large files — an oversized,
-    context-blowing request. Callers reject ``None`` with HTTP 415.
+    Supports images, PDF, text/code, and all other arbitrary binary/document files.
 
     :param content_type: The resolved MIME type, e.g. ``"image/png"``.
-        Use :func:`_resolve_content_type` to derive it from the upload's
-        declared type + filename first.
     :returns: The per-type byte limit (still subject to
-        :data:`MAX_ATTACHMENT_UPLOAD_BYTES`), or ``None`` when the type is
-        not an allowed attachment.
+        :data:`MAX_ATTACHMENT_UPLOAD_BYTES`).
     """
     if content_type.startswith("image/"):
         return MAX_IMAGE_UPLOAD_BYTES
@@ -158,7 +148,7 @@ def attachment_upload_limit(content_type: str) -> int | None:
         return MAX_PDF_UPLOAD_BYTES
     if content_type.startswith("text/") or content_type in _TEXT_LIKE_APPLICATION_MIMES:
         return MAX_TEXT_UPLOAD_BYTES
-    return None
+    return MAX_ATTACHMENT_UPLOAD_BYTES
 
 
 # Extensions accepted as text/code attachments even when the upload's

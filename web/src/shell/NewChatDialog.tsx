@@ -4518,7 +4518,6 @@ export function NewChatLandingScreen() {
               ref={fileInputRef}
               type="file"
               multiple
-              accept="image/*,application/pdf,text/*,application/json"
               className="hidden"
               data-testid="new-chat-landing-file-input"
               onChange={(e) => {

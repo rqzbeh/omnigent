@@ -1289,33 +1289,19 @@ def register_resources_routes(
         )
 
         # Resolve the type from the declared MIME + filename BEFORE reading
-        # the body, so an unsupported or oversized upload is rejected without
-        # buffering it. Attachments are inlined into the model context as
-        # base64 (see content_resolver.resolve_content_references); only
-        # images, PDF, and text/code files are usable — others (pptx, docx,
-        # zip, …) would be garbled or blow the request size, so reject them.
+        # the body, so an oversized upload is rejected without buffering it.
         content_type = _resolve_content_type(
             file.content_type,
             file.filename,
         )
         type_limit = attachment_upload_limit(content_type)
         if type_limit is None:
-            # The browser/OS can mislabel a text/code file as binary (e.g. a
-            # .csv reported as application/vnd.ms-excel on Windows). Fall back
-            # to the extension — matching the web client's allowlist — and
-            # normalize the type so the resolver inlines it as text.
             ext_type = attachment_text_type_for_extension(file.filename)
             if ext_type is not None:
                 content_type = ext_type
                 type_limit = attachment_upload_limit(content_type)
         if type_limit is None:
-            raise HTTPException(
-                status_code=415,
-                detail=(
-                    f"Unsupported attachment type '{content_type}'. Only images, "
-                    "PDF, and text/code files can be attached."
-                ),
-            )
+            type_limit = MAX_ATTACHMENT_UPLOAD_BYTES
         content = await _read_upload_capped(
             file,
             min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES),

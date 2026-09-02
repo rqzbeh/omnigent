@@ -5174,7 +5174,6 @@ export function Composer({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf,text/*,application/json"
         className="hidden"
         onChange={(e) => {
           if (e.target.files) {
